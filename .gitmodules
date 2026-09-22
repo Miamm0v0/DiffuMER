@@ -1,0 +1,3 @@
+[submodule "third_party/LLaDA-V"]
+	path = third_party/LLaDA-V
+	url = https://github.com/ML-GSAI/LLaDA-V.git
