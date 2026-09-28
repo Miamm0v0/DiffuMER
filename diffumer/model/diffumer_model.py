@@ -337,9 +337,10 @@ class DiffuMERModel(nn.Module):
             dtype=adapter_parameter.dtype,
         )
         audio_attention_mask = audio_attention_mask.to(adapter_parameter.device)
-        embeddings = self.audio_adapter(
+        embeddings, audio_attention_mask = self.audio_adapter(
             audio_features,
             audio_attention_mask=audio_attention_mask,
+            return_attention_mask=True,
         )
         embedding_device, embedding_dtype = self._embedding_device_and_dtype()
         return (
