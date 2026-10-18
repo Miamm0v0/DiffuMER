@@ -14,6 +14,19 @@ from .canvas import CanvasBatch, CanvasBuilder, CanvasConfig
 
 
 @dataclass(slots=True)
+class ConditionBatch:
+    """Reusable AVT embeddings before the backbone, retaining their gradients.
+
+    Embeddings have shape [batch, condition_length, hidden_size]; the mask has
+    shape [batch, condition_length]. Modality spans index the condition prefix.
+    """
+
+    embeddings: torch.Tensor
+    attention_mask: torch.Tensor
+    modality_spans: dict[str, slice]
+
+
+@dataclass(slots=True)
 class DiffuMEROutput:
     """Outputs aligned to the fixed E-R-Y canvas."""
 
@@ -27,6 +40,7 @@ class DiffuMEROutput:
     modality_spans: dict[str, slice]
     full_hidden_states: torch.Tensor | None = None
     backbone_outputs: Any | None = None
+    verification_scores: torch.Tensor | dict[str, torch.Tensor] | None = None
 
 
 class DiffuMERModel(nn.Module):
@@ -57,6 +71,8 @@ class DiffuMERModel(nn.Module):
         self.image_processor = image_processor
         self.max_visual_tokens = max_visual_tokens
         self.max_text_tokens = max_text_tokens
+        # Assigning an nn.Module later keeps verifier parameters in state_dict.
+        self.add_module("verifier_heads", None)
 
         if max_visual_tokens is not None and max_visual_tokens <= 0:
             raise ValueError("max_visual_tokens must be positive or None.")
@@ -425,9 +441,8 @@ class DiffuMERModel(nn.Module):
         wrapped_mask = torch.cat((present, attention_mask, present), dim=1)
         return wrapped_embeddings, wrapped_mask
 
-    def forward(
+    def encode_conditions(
         self,
-        canvas: CanvasBatch,
         *,
         video_frames: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
         audio_features: torch.Tensor | None = None,
@@ -435,20 +450,51 @@ class DiffuMERModel(nn.Module):
         text_input_ids: torch.Tensor | None = None,
         text_attention_mask: torch.Tensor | None = None,
         transcripts: Sequence[str] | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_full_hidden_states: bool = False,
-        return_backbone_outputs: bool = False,
-    ) -> DiffuMEROutput:
-        if canvas.input_ids.ndim != 2:
-            raise ValueError("canvas.input_ids must have shape [batch, canvas_length].")
-        expected_canvas_length = self.canvas_builder.layout.sequence_length
-        if canvas.input_ids.shape[1] != expected_canvas_length:
+        batch_size: int | None = None,
+    ) -> ConditionBatch:
+        """Encode and wrap AVT once for reuse across canvas forward passes.
+
+        Infer batch size from the available inputs, defaulting to one when
+        none are present. A 4-D video tensor alone is treated as one sample's
+        [frames, channels, height, width]; specify batch_size for [B, C, H, W]
+        or for condition-free batches. Gradient tracking follows the caller.
+        """
+        inferred_sizes: dict[str, int] = {}
+        for name, tensor, sample_rank in (
+            ("audio_features", audio_features, 2),
+            ("text_input_ids", text_input_ids, 1),
+        ):
+            if tensor is None:
+                continue
+            if tensor.ndim == sample_rank:
+                inferred_sizes[name] = 1
+            elif tensor.ndim == sample_rank + 1:
+                inferred_sizes[name] = tensor.shape[0]
+            else:
+                raise ValueError(
+                    f"{name} must have rank {sample_rank} or {sample_rank + 1}."
+                )
+        if transcripts is not None:
+            inferred_sizes["transcripts"] = len(transcripts)
+        if isinstance(video_frames, torch.Tensor):
+            if video_frames.ndim == 5:
+                inferred_sizes["video_frames"] = video_frames.shape[0]
+            elif video_frames.ndim == 3:
+                inferred_sizes["video_frames"] = 1
+            elif video_frames.ndim != 4:
+                raise ValueError("video_frames tensor must have rank 3, 4, or 5.")
+        elif video_frames is not None:
+            inferred_sizes["video_frames"] = len(video_frames)
+
+        if batch_size is None:
+            batch_size = next(iter(inferred_sizes.values()), 1)
+        if batch_size <= 0:
+            raise ValueError("Condition batch_size must be positive.")
+        if any(size != batch_size for size in inferred_sizes.values()):
             raise ValueError(
-                f"Expected canvas length {expected_canvas_length}, got "
-                f"{canvas.input_ids.shape[1]}."
+                f"Condition inputs must match batch_size={batch_size}; got "
+                f"{inferred_sizes}."
             )
-        batch_size = canvas.input_ids.shape[0]
 
         visual_embeddings, visual_mask = self._encode_visual_batch(
             video_frames,
@@ -490,20 +536,81 @@ class DiffuMERModel(nn.Module):
             all_embeddings.append(wrapped_embeddings)
             all_masks.append(wrapped_mask)
 
+        if all_embeddings:
+            embeddings = torch.cat(all_embeddings, dim=1)
+            attention_mask = torch.cat(all_masks, dim=1)
+        else:
+            embeddings, attention_mask = self._pad_embedding_sequences(
+                [None] * batch_size,
+                batch_size,
+            )
+        return ConditionBatch(
+            embeddings=embeddings,
+            attention_mask=attention_mask,
+            modality_spans=modality_spans,
+        )
+
+    def forward_canvas(
+        self,
+        conditions: ConditionBatch,
+        canvas: CanvasBatch,
+        *,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_full_hidden_states: bool = False,
+        return_backbone_outputs: bool = False,
+    ) -> DiffuMEROutput:
+        """Run a fresh backbone pass using cached AVT and the current canvas.
+
+        Only pre-backbone condition embeddings are reused. Hidden states are
+        recomputed because bidirectional attention depends on the canvas.
+        Canvas-local token indices remain independent of the prefix offset;
+        output modality_spans continue to index the complete sequence.
+        """
+        if canvas.input_ids.ndim != 2:
+            raise ValueError("canvas.input_ids must have shape [batch, canvas_length].")
+        expected_canvas_length = self.canvas_builder.layout.sequence_length
+        if canvas.input_ids.shape[1] != expected_canvas_length:
+            raise ValueError(
+                f"Expected canvas length {expected_canvas_length}, got "
+                f"{canvas.input_ids.shape[1]}."
+            )
+        if (
+            conditions.embeddings.ndim != 3
+            or conditions.embeddings.shape[0] != canvas.input_ids.shape[0]
+            or conditions.embeddings.shape[2] != int(self.llada_v.config.hidden_size)
+        ):
+            raise ValueError(
+                "conditions.embeddings must have shape "
+                "[canvas_batch_size, condition_length, llada_hidden_size]."
+            )
+        if tuple(conditions.attention_mask.shape) != tuple(conditions.embeddings.shape[:2]):
+            raise ValueError(
+                "conditions.attention_mask must match [batch, condition_length]."
+            )
+
         canvas_input_ids = canvas.input_ids.to(self._embedding_device_and_dtype()[0])
         canvas_embeddings = self._embed_token_ids(canvas_input_ids)
         canvas_mask = canvas.attention_mask.to(
             device=canvas_embeddings.device,
             dtype=torch.bool,
         )
-        canvas_start = cursor
-        canvas_end = cursor + canvas_embeddings.shape[1]
+        condition_embeddings = conditions.embeddings.to(
+            device=canvas_embeddings.device,
+            dtype=canvas_embeddings.dtype,
+        )
+        condition_mask = conditions.attention_mask.to(
+            device=canvas_embeddings.device,
+            dtype=torch.bool,
+        )
+        canvas_start = condition_embeddings.shape[1]
+        canvas_end = canvas_start + canvas_embeddings.shape[1]
+        # Copy span metadata so advancing the canvas does not mutate the cache.
+        modality_spans = dict(conditions.modality_spans)
         modality_spans["canvas"] = slice(canvas_start, canvas_end)
-        all_embeddings.append(canvas_embeddings)
-        all_masks.append(canvas_mask)
 
-        inputs_embeds = torch.cat(all_embeddings, dim=1)
-        attention_mask = torch.cat(all_masks, dim=1)
+        inputs_embeds = torch.cat((condition_embeddings, canvas_embeddings), dim=1)
+        attention_mask = torch.cat((condition_mask, canvas_mask), dim=1)
         if self.context_length is not None and inputs_embeds.shape[1] > self.context_length:
             raise ValueError(
                 f"Combined multimodal sequence has length {inputs_embeds.shape[1]}, "
@@ -543,3 +650,80 @@ class DiffuMERModel(nn.Module):
             ),
         )
         return output
+
+    def verify_canvas(
+        self,
+        conditions: ConditionBatch,
+        canvas: CanvasBatch,
+        *,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_full_hidden_states: bool = False,
+        return_backbone_outputs: bool = False,
+    ) -> DiffuMEROutput:
+        """Forward a draft canvas, then score its canvas-aligned hidden states.
+
+        Register an nn.Module as verifier_heads before semantic verification.
+        Its forward receives hidden states plus keyword arguments
+        attention_mask and block_ids, both indexed relative to the canvas,
+        and returns a score tensor or a dictionary of score tensors.
+        """
+        if self.verifier_heads is None:
+            raise RuntimeError(
+                "Semantic verification requires verifier_heads, but no scoring "
+                "head is registered. Assign a scoring nn.Module before calling "
+                "verify_canvas()."
+            )
+        output = self.forward_canvas(
+            conditions,
+            canvas,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_full_hidden_states=return_full_hidden_states,
+            return_backbone_outputs=return_backbone_outputs,
+        )
+        scores = self.verifier_heads(
+            output.canvas_hidden_states,
+            attention_mask=output.canvas_attention_mask,
+            block_ids=canvas.block_ids.to(output.canvas_hidden_states.device),
+        )
+        if scores is None:
+            raise RuntimeError("verifier_heads returned no verification scores.")
+        output.verification_scores = scores
+        return output
+
+    def forward(
+        self,
+        canvas: CanvasBatch,
+        *,
+        video_frames: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
+        audio_features: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
+        text_input_ids: torch.Tensor | None = None,
+        text_attention_mask: torch.Tensor | None = None,
+        transcripts: Sequence[str] | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_full_hidden_states: bool = False,
+        return_backbone_outputs: bool = False,
+    ) -> DiffuMEROutput:
+        """Preserve the training API by encoding AVT then forwarding the canvas."""
+        if canvas.input_ids.ndim != 2:
+            raise ValueError("canvas.input_ids must have shape [batch, canvas_length].")
+        conditions = self.encode_conditions(
+            video_frames=video_frames,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask,
+            transcripts=transcripts,
+            batch_size=canvas.input_ids.shape[0],
+        )
+        return self.forward_canvas(
+            conditions,
+            canvas,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_full_hidden_states=return_full_hidden_states,
+            return_backbone_outputs=return_backbone_outputs,
+        )

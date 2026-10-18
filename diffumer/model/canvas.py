@@ -70,7 +70,11 @@ class CanvasConfig:
 
 @dataclass(frozen=True, slots=True)
 class CanvasLayout:
-    """Absolute positions and content slices in one fixed-size canvas."""
+    """Positions and content slices relative to the canvas, excluding AVT.
+
+    The default layout has 212 positions: 200 mutable content positions and
+    12 fixed boundary positions.
+    """
 
     sequence_length: int
     canvas_start_position: int
@@ -136,6 +140,17 @@ class CanvasBatch:
     supervision_mask: torch.Tensor
     block_ids: torch.Tensor
 
+    def clone(self) -> "CanvasBatch":
+        """Copy all six tensors into independent storage for drafts/trajectories."""
+        return CanvasBatch(
+            input_ids=self.input_ids.clone(),
+            attention_mask=self.attention_mask.clone(),
+            labels=self.labels.clone(),
+            output_mask=self.output_mask.clone(),
+            supervision_mask=self.supervision_mask.clone(),
+            block_ids=self.block_ids.clone(),
+        )
+
     def to(self, device: torch.device | str) -> "CanvasBatch":
         return CanvasBatch(
             input_ids=self.input_ids.to(device),
@@ -145,6 +160,21 @@ class CanvasBatch:
             supervision_mask=self.supervision_mask.to(device),
             block_ids=self.block_ids.to(device),
         )
+
+
+@dataclass(slots=True)
+class VisibleSpan:
+    """A contiguous visible fragment with zero-based canvas-local positions.
+
+    ``token_indices`` exclude any AVT prefix offset and never include canvas
+    or block boundary positions.
+    """
+
+    batch_index: int
+    block_name: str
+    token_indices: list[int]
+    token_ids: list[int]
+    text: str
 
 
 def _token_id(tokenizer: Any, token: str) -> int:
@@ -351,6 +381,63 @@ class CanvasBuilder:
         )
         mask[:, self.layout.block_slices[block_name]] = True
         return mask
+
+    def extract_visible_spans(
+        self,
+        token_ids: torch.Tensor | CanvasBatch,
+    ) -> list[VisibleSpan]:
+        """Read intermediate fragments in batch/block/position order.
+
+        Accept a ``CanvasBatch`` or token ids shaped ``[canvas_length]`` or
+        ``[batch, canvas_length]``. MASK separates fragments without ending
+        the scan; EOS/PAD ends semantic content in that block. Returned
+        indices are zero-based positions in the canvas, not the AVT sequence.
+        """
+        if isinstance(token_ids, CanvasBatch):
+            token_ids = token_ids.input_ids
+        if token_ids.ndim == 1:
+            token_ids = token_ids.unsqueeze(0)
+        if token_ids.ndim != 2 or token_ids.shape[1] != self.layout.sequence_length:
+            raise ValueError(
+                "token_ids must have shape [batch, canvas_length], got "
+                f"{tuple(token_ids.shape)}."
+            )
+
+        terminal_ids = {self.token_ids.eos, self.token_ids.pad}
+        stop_ids = terminal_ids | {self.token_ids.mask}
+        spans: list[VisibleSpan] = []
+        for batch_index, row in enumerate(token_ids.detach().cpu().tolist()):
+            for block_name in TARGET_BLOCKS:
+                block_slice = self.layout.block_slices[block_name]
+                token_index = block_slice.start
+                while token_index < block_slice.stop:
+                    token_id = row[token_index]
+                    if token_id in terminal_ids:
+                        break
+                    if token_id == self.token_ids.mask:
+                        token_index += 1
+                        continue
+
+                    start = token_index
+                    while (
+                        token_index < block_slice.stop
+                        and row[token_index] not in stop_ids
+                    ):
+                        token_index += 1
+                    content = row[start:token_index]
+                    spans.append(
+                        VisibleSpan(
+                            batch_index=batch_index,
+                            block_name=block_name,
+                            token_indices=list(range(start, token_index)),
+                            token_ids=content,
+                            text=self.tokenizer.decode(
+                                content,
+                                skip_special_tokens=True,
+                            ).strip(),
+                        )
+                    )
+        return spans
 
     def decode_blocks(self, token_ids: torch.Tensor) -> list[dict[str, str]]:
         """Decode canvases, stopping each block at EOS, PAD, or remaining MASK."""

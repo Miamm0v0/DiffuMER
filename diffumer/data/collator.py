@@ -1,8 +1,8 @@
-"""Batch collation for DiffuMER multimodal diffusion training."""
+"""Batch collation for DiffuMER training, loss evaluation, and generation."""
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import torch
 
@@ -14,13 +14,17 @@ from .masking import MaskingConfig, corrupt_canvas
 class DiffuMERDataCollator:
     """Convert ``DiffuMERDataset`` samples into one model-ready batch.
 
-    Training flow:
+    Training and loss-evaluation flow:
 
         dataset samples
             -> gather/pad multimodal conditions
             -> encode clean E_v/E_a/E_t/R/Y canvas S_0
             -> corrupt supervised canvas tokens to S_t
             -> return model inputs plus diffusion metadata
+
+    Generation always starts from a fully masked canvas, even when samples
+    have gold targets. Targets are returned separately as ``references`` in
+    every mode; generation references may include ``None`` entries.
 
     ``canvas_builder`` should normally be ``model.canvas_builder`` so tokenizer,
     special-token ids, and canvas layout exactly match the model.
@@ -32,12 +36,17 @@ class DiffuMERDataCollator:
         *,
         image_processor: Any | None = None,
         masking_config: MaskingConfig | None = None,
-        training: bool = True,
+        mode: Literal["train", "loss_eval", "generate"] = "train",
     ) -> None:
+        if mode not in {"train", "loss_eval", "generate"}:
+            raise ValueError(
+                "mode must be 'train', 'loss_eval', or 'generate'; "
+                f"got {mode!r}."
+            )
         self.canvas_builder = canvas_builder
         self.image_processor = image_processor
         self.masking_config = masking_config or MaskingConfig()
-        self.training = training
+        self.mode = mode
 
     def _process_video_frames(
         self,
@@ -247,7 +256,9 @@ class DiffuMERDataCollator:
         mask_probabilities: torch.Tensor | None = None
         corruption_mask: torch.Tensor | None = None
 
-        if self.training:
+        if self.mode == "generate":
+            canvas = self.canvas_builder.build_masked(len(samples))
+        else:
             if any(target is None for target in targets):
                 missing = [
                     str(samples[index].get("sample_id", index))
@@ -255,7 +266,8 @@ class DiffuMERDataCollator:
                     if target is None
                 ]
                 raise ValueError(
-                    "Training requires targets for every sample; missing target "
+                    f"mode={self.mode!r} requires targets for every sample; "
+                    "missing target "
                     f"for {missing[:5]}."
                 )
 
@@ -278,35 +290,8 @@ class DiffuMERDataCollator:
             mask_probabilities = masking_result.mask_probabilities
             corruption_mask = masking_result.corruption_mask
 
-        else:
-            has_targets = [
-                target is not None
-                for target in targets
-            ]
-
-            if all(has_targets):
-                # Validation with gold targets: return clean S_0 canvas.
-                canvas = self.canvas_builder.encode_targets(
-                    [
-                        target
-                        for target in targets
-                        if target is not None
-                    ]
-                )
-            elif not any(has_targets):
-                # Pure generation/test batch: begin from fully masked canvas.
-                canvas = self.canvas_builder.build_masked(
-                    len(samples)
-                )
-            else:
-                raise ValueError(
-                    "Evaluation/inference batches cannot mix samples with "
-                    "and without targets."
-                )
-
-        # Keys used by DiffuMERModel.forward are kept at the top level.
-        # timesteps/mask_probabilities/corruption_mask are consumed by the
-        # training objective rather than by the backbone forward pass.
+        # Only AVT inputs and the current canvas are passed to the model.
+        # Diffusion metadata belongs to the loss; references belong to metrics.
         return {
             "canvas": canvas,
             "video_frames": video_frames,
@@ -316,6 +301,7 @@ class DiffuMERDataCollator:
             "timesteps": timesteps,
             "mask_probabilities": mask_probabilities,
             "corruption_mask": corruption_mask,
+            "references": targets,
             "sample_ids": [
                 str(sample.get("sample_id", index))
                 for index, sample in enumerate(samples)
